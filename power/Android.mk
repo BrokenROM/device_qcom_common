@@ -41,6 +41,10 @@ ifeq ($(call is-board-platform-in-list, msm8916), true)
 LOCAL_SRC_FILES += power-8916.c
 endif
 
+ifeq ($(call is-board-platform-in-list, msm8952), true)
+LOCAL_SRC_FILES += power-8952.c
+endif
+
 ifeq ($(call is-board-platform-in-list, apq8084), true)
 LOCAL_SRC_FILES += power-8084.c
 endif
@@ -56,6 +60,16 @@ endif
 ifneq ($(TARGET_POWERHAL_SET_INTERACTIVE_EXT),)
 LOCAL_CFLAGS += -DSET_INTERACTIVE_EXT
 LOCAL_SRC_FILES += ../../../../$(TARGET_POWERHAL_SET_INTERACTIVE_EXT)
+endif
+
+ifneq ($(TARGET_TAP_TO_WAKE_NODE),)
+  LOCAL_CFLAGS += -DTAP_TO_WAKE_NODE=\"$(TARGET_TAP_TO_WAKE_NODE)\"
+endif
+
+ifeq ($(TARGET_POWER_SET_FEATURE_LIB),)
+  LOCAL_SRC_FILES += power-feature-default.c
+else
+  LOCAL_STATIC_LIBRARIES += $(TARGET_POWER_SET_FEATURE_LIB)
 endif
 
 ifneq ($(CM_POWERHAL_EXTENSION),)
