@@ -31,8 +31,9 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 
 #include "utils.h"
 #include "list.h"
@@ -42,6 +43,12 @@
 #define LOG_TAG "QCOM PowerHAL"
 #include <utils/Log.h>
 
+#define USINSEC 1000000L
+#define NSINUS 1000L
+
+#define SOC_ID_0 "/sys/devices/soc0/soc_id"
+#define SOC_ID_1 "/sys/devices/system/soc/soc0/id"
+
 char scaling_gov_path[4][80] ={
     "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
     "sys/devices/system/cpu/cpu1/cpufreq/scaling_governor",
@@ -50,10 +57,15 @@ char scaling_gov_path[4][80] ={
 };
 
 static void *qcopt_handle;
+static void *iop_handle;
 static int (*perf_lock_acq)(unsigned long handle, int duration,
     int list[], int numArgs);
 static int (*perf_lock_rel)(unsigned long handle);
+static int (*perf_lock_use_profile)(unsigned long handle, int profile);
+static int (*perf_io_prefetch_start)(int, const char*);
+static int (*perf_io_prefetch_stop)();
 static struct list_node active_hint_list_head;
+static int profile_handle = 0;
 
 static void *get_qcopt_handle()
 {
@@ -74,6 +86,21 @@ static void *get_qcopt_handle()
     return handle;
 }
 
+static void *get_iop_handle()
+{
+    char iop_lib_path[PATH_MAX] = {0};
+    void *handle = NULL;
+
+    dlerror();
+
+    handle = dlopen("libqti-iop-client.so", RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        ALOGE("Unable to open prefetcher: %s\n", dlerror());
+    }
+
+    return handle;
+}
+
 static void __attribute__ ((constructor)) initialize(void)
 {
     qcopt_handle = get_qcopt_handle();
@@ -86,16 +113,52 @@ static void __attribute__ ((constructor)) initialize(void)
          * function pointers.
          */
         perf_lock_acq = dlsym(qcopt_handle, "perf_lock_acq");
-
         if (!perf_lock_acq) {
-            ALOGE("Unable to get perf_lock_acq function handle.\n");
+            goto fail_qcopt;
         }
 
         perf_lock_rel = dlsym(qcopt_handle, "perf_lock_rel");
-
         if (!perf_lock_rel) {
-            ALOGE("Unable to get perf_lock_rel function handle.\n");
+            goto fail_qcopt;
         }
+
+        // optional
+        perf_lock_use_profile = dlsym(qcopt_handle, "perf_lock_use_profile");
+    }
+
+    iop_handle = get_iop_handle();
+
+    if (!iop_handle) {
+        ALOGE("Failed to get prefetcher handle.\n");
+    } else {
+        perf_io_prefetch_start = (int(*)(int, const char *))dlsym(
+                iop_handle, "perf_io_prefetch_start");
+        if (!perf_io_prefetch_start) {
+            goto fail_iop;
+        }
+
+        perf_io_prefetch_stop = (int(*)())dlsym(
+                iop_handle, "perf_io_prefetch_stop");
+        if (!perf_io_prefetch_stop) {
+            goto fail_iop;
+        }
+    }
+    return;
+
+fail_qcopt:
+    perf_lock_acq = NULL;
+    perf_lock_rel = NULL;
+    if (qcopt_handle) {
+        dlclose(qcopt_handle);
+        qcopt_handle = NULL;
+    }
+
+fail_iop:
+    perf_io_prefetch_start = NULL;
+    perf_io_prefetch_stop = NULL;
+    if (iop_handle) {
+        dlclose(iop_handle);
+        iop_handle = NULL;
     }
 }
 
@@ -104,6 +167,10 @@ static void __attribute__ ((destructor)) cleanup(void)
     if (qcopt_handle) {
         if (dlclose(qcopt_handle))
             ALOGE("Error occurred while closing qc-opt library.");
+    }
+    if (iop_handle) {
+        if (dlclose(iop_handle))
+            ALOGE("Error occurred while closing prefetcher library.");
     }
 }
 
@@ -182,29 +249,26 @@ int get_scaling_governor(char governor[], int size)
 
 int get_scaling_governor_check_cores(char governor[], int size,int core_num)
 {
+   if (sysfs_read(scaling_gov_path[core_num], governor,
+               size) == -1) {
+      // Can't obtain the scaling governor. Return.
+      return -1;
+   }
 
-    if (sysfs_read(scaling_gov_path[core_num], governor,
-                size) == -1) {
-        // Can't obtain the scaling governor. Return.
-        return -1;
-    }
-
-    // Strip newline at the end.
-    int len = strlen(governor);
-    len--;
-    while (len >= 0 && (governor[len] == '\n' || governor[len] == '\r'))
+   // Strip newline at the end.
+   int len = strlen(governor);
+   len--;
+   while (len >= 0 && (governor[len] == '\n' || governor[len] == '\r'))
         governor[len--] = '\0';
-
-    return 0;
+   return 0;
 }
 
-int interaction(int duration, int num_args, int opt_list[])
+void interaction(int duration, int num_args, int opt_list[])
 {
-#ifdef INTERACTION_BOOST
-    int lock_handle = 0;
+    static int lock_handle = 0;
 
-    if (duration < 0 || num_args < 1 || opt_list[0] == NULL)
-        return 0;
+    if (duration <= 0 || num_args < 1 || opt_list[0] == 0)
+        return;
 
     if (qcopt_handle) {
         if (perf_lock_acq) {
@@ -213,32 +277,6 @@ int interaction(int duration, int num_args, int opt_list[])
                 ALOGE("Failed to acquire lock.");
         }
     }
-    return lock_handle;
-#endif
-    return 0;
-}
-
-int interaction_with_handle(int lock_handle, int duration, int num_args, int opt_list[]) 
-{
-#ifdef INTERACTION_BOOST
-    if (duration < 0 || num_args < 1 || opt_list[0] == NULL)
-        return 0;
-
-    if (qcopt_handle) {
-        if (perf_lock_acq) {
-            lock_handle = perf_lock_acq(lock_handle, duration, opt_list, num_args);
-            if (lock_handle == -1)
-                ALOGE("Failed to acquire lock.");
-        }
-    }
-    return lock_handle;
-#endif
-    return 0;
- }
-
-void release_request(int lock_handle) {
-    if (qcopt_handle && perf_lock_rel)
-        perf_lock_rel(lock_handle);
 }
 
 void perform_hint_action(int hint_id, int resource_values[], int num_resources)
@@ -333,4 +371,56 @@ void undo_initial_hint_action()
             perf_lock_rel(1);
         }
     }
+}
+
+/* Set a static profile */
+void set_profile(int profile)
+{
+    if (qcopt_handle) {
+        if (perf_lock_use_profile) {
+            profile_handle = perf_lock_use_profile(profile_handle, profile);
+            if (profile_handle == -1)
+                ALOGE("Failed to set profile.");
+            if (profile < 0)
+                profile_handle = 0;
+        }
+    }
+}
+
+void start_prefetch(int pid, const char* packageName) {
+    if (iop_handle) {
+        if (perf_io_prefetch_start) {
+            perf_io_prefetch_start(pid, packageName);
+        }
+    }
+}
+
+long long calc_timespan_us(struct timespec start, struct timespec end)
+{
+    long long diff_in_us = 0;
+    diff_in_us += (end.tv_sec - start.tv_sec) * USINSEC;
+    diff_in_us += (end.tv_nsec - start.tv_nsec) / NSINUS;
+    return diff_in_us;
+}
+
+int get_soc_id(void)
+{
+    int fd;
+    int soc_id = -1;
+    char buf[10] = { 0 };
+
+    if (!access(SOC_ID_0, F_OK))
+        fd = open(SOC_ID_0, O_RDONLY);
+    else
+        fd = open(SOC_ID_1, O_RDONLY);
+
+    if (fd >= 0) {
+        if (read(fd, buf, sizeof(buf) - 1) == -1)
+            ALOGW("Unable to read soc_id");
+        else
+            soc_id = atoi(buf);
+    }
+
+    close(fd);
+    return soc_id;
 }
